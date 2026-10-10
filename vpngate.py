@@ -6,7 +6,7 @@ VPN Gate SSTP 节点检测流水线 (精简版)
   1. 获取 VPN Gate 原始节点
   2. 只保留带 TCP 入口的 SSTP 节点
   3. 去重
-  4. 并发调用检测 Worker
+  4. 并发直连检测 SSTP 节点 (Runner 直连, 无需 Cloudflare Worker)
   5. 生成 public/data.json + public/index.html + public/nodes.txt
 """
 
@@ -16,8 +16,12 @@ import io
 import json
 import os
 import re
+import socket
+import ssl
+import struct
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -226,41 +230,98 @@ def classify_network(host, exit_org, is_datacenter=None):
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
     return "unknown"
 
+def sstp_probe(host, port, timeout=20):
+    """直连 SSTP 可用性探测 (无需 Cloudflare Worker)。
+
+    流程: TCP 建连 -> 发送 SSTP_DUPLEX_POST -> TLS 握手 ->
+    发送 Call Connect Request, 收到 Call Connect Ack(0x0002) 即判定可用。
+    返回 (ok, latency_ms, error)。
+    """
+    t0 = time.monotonic()
+    raw = None
+    try:
+        raw = socket.create_connection((host, int(port)), timeout=timeout)
+    except Exception as exc:
+        return False, None, f"TCP 连接失败: {exc}"
+    try:
+        raw.settimeout(timeout)
+        corr = str(uuid.uuid4()).upper()
+        req = (
+            "SSTP_DUPLEX_POST /sra_{BA195980-CD49-45B0-BEE3-7A8E45B53B2B}/ HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Content-Length: 18446744073709551615\r\n"
+            f"SSTPCORRELATIONID: {{{corr}}}\r\n"
+            "\r\n"
+        )
+        raw.sendall(req.encode("ascii"))
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = raw.recv(4096)
+            if not chunk:
+                return False, None, "HTTP 阶段无响应"
+            head += chunk
+            if len(head) > 16384:
+                return False, None, "HTTP 响应头过长"
+        status_line = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+        if not status_line.startswith("HTTP/1.1 200") and not status_line.startswith("HTTP/1.0 200"):
+            return False, None, f"HTTP 拒绝: {status_line[:80]}"
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls = ctx.wrap_socket(raw, server_hostname=host)
+        raw = None  # 所有权移交 tls
+        tls.settimeout(timeout)
+        # SSTP Call Connect Request: 头(6B: ver/res/msgtype/长度=14) + 属性数(2B)=1
+        # + 属性(Encapsulated Protocol ID=PPP: id=1,长度=8,值=0x0001)
+        pkt = struct.pack(">BBHH", 0x10, 0x00, 0x0001, 14) + struct.pack(">HBBI", 1, 0x01, 8, 0x0001)
+        tls.sendall(pkt)
+        hdr = b""
+        while len(hdr) < 6:
+            chunk = tls.recv(6 - len(hdr))
+            if not chunk:
+                break
+            hdr += chunk
+        if len(hdr) < 6:
+            tls.close()
+            return False, None, "SSTP 无控制响应"
+        _ver, _res, mtype, length = struct.unpack(">BBHH", hdr)
+        body = b""
+        while len(body) < max(0, length - 6):
+            chunk = tls.recv(length - 6 - len(body))
+            if not chunk:
+                break
+            body += chunk
+        latency = int((time.monotonic() - t0) * 1000)
+        tls.close()
+        if mtype == 0x0002:  # Call Connect Ack
+            return True, latency, None
+        return False, None, f"SSTP 拒绝 (msg=0x{mtype:04x})"
+    except Exception as exc:
+        return False, None, f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            if raw is not None:
+                raw.close()
+        except Exception:
+            pass
+
+
 def check_one(node, session):
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["status"] = "failed"
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
-    out["residential"] = "unknown"
-    try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
-        if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
-            out["worker_error"] = True
-            return out
-        j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
-        out["latency_ms"] = j.get("responseTime")
-        out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
-        exit_info = j.get("exit") or {}
-        if exit_info:
-            asn = exit_info.get("asn") or {}
-            org = asn.get("org") or asn.get("name") or ""
-            out["exit"] = {"ip": exit_info.get("ip"), "country": exit_info.get("country"), "country_code": exit_info.get("country_code"), "city": exit_info.get("city"), "continent": exit_info.get("continent"), "asn": asn.get("asn"), "org": org, "type": asn.get("type"), "is_datacenter": exit_info.get("is_datacenter")}
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
-        else:
-            out["residential"] = classify_network(out["host"], None, None)
-        return out
-    except Exception as exc:
-        out["error"] = f"{type(exc).__name__}: {exc}"
-        out["worker_error"] = True
-        return out
+    out["colo"] = None
+    probe_timeout = max(5, min(20, int(float(CHECK_TIMEOUT) or 20)))
+    ok, latency, err = sstp_probe(node["host"], node["port"], timeout=probe_timeout)
+    out["success"] = ok
+    out["status"] = "success" if ok else "failed"
+    out["latency_ms"] = latency
+    out["error"] = err
+    out["residential"] = classify_network(out["host"], None, None)
+    return out
 
 def check_all(nodes, session):
     results = []
@@ -289,7 +350,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
         by_country[name] = grp
 
-    data = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "source": source, "worker": WORKER_CHECK_URL, "stats": stats, "countries": by_country, "available": available}
+    data = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "source": source, "worker": "direct-sstp (runner)", "stats": stats, "countries": by_country, "available": available}
     return data
 
 # edgetunnel 入口地址池
@@ -376,21 +437,20 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+    log("直连检测", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
     results = check_all(uniq, session)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
-    worker_errors = [r for r in failed if r.get("worker_error")]
 
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
-    log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+    log("直连检测", f"检测成功: {len(success)}")
+    log("直连检测", f"检测失败: {len(failed)}")
+    log("直连检测", f"耗时: {elapsed:.1f}s")
 
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+    if uniq and not success:
+        die("全部节点直连检测失败, 可能是 Runner 出站受限或探测逻辑异常 — 本次运行判定失败 (不生成空结果)")
 
     data = build_outputs(results, raw_count, sstp_count, source)
     log("RESULT", f"可用节点: {len(success)}")
